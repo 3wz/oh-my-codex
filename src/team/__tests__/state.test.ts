@@ -248,6 +248,7 @@ describe('team state', () => {
       assert.equal(diskCfg.hud_pane_id, null);
       assert.equal(diskCfg.resize_hook_name, null);
       assert.equal(diskCfg.resize_hook_target, null);
+      assert.equal(diskCfg.restore_hud_on_shutdown, false);
       assert.equal(typeof diskCfg.next_task_id, 'number');
       assert.ok(Array.isArray(diskCfg.workers));
       assert.equal(diskCfg.workers.length, 2);
@@ -575,6 +576,7 @@ exit 1
       assert.equal(manifest?.hud_pane_id, null);
       assert.equal(manifest?.resize_hook_name, null);
       assert.equal(manifest?.resize_hook_target, null);
+      assert.equal(manifest?.restore_hud_on_shutdown, false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

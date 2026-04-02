@@ -37,6 +37,8 @@ export interface TeamSession {
   resizeHookName: string | null;
   /** Registered tmux resize hook target in "<session>:<window>" form, or null. */
   resizeHookTarget: string | null;
+  /** Whether this window had a standalone HUD before team mode replaced it. */
+  restoreStandaloneHudOnShutdown: boolean;
 }
 
 const INJECTION_MARKER = '[OMX_TMUX_INJECT]';
@@ -254,6 +256,18 @@ function shellQuoteSingle(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function stripAnsiEscapeSequences(value: string): string {
+  return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
+
+function quotePowerShellArg(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function encodePowerShellCommand(commandText: string): string {
+  return Buffer.from(commandText, 'utf16le').toString('base64');
+}
+
 function normalizeTmuxHookToken(value: string): string {
   const normalized = value.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
   return normalized === '' ? 'unknown' : normalized;
@@ -300,6 +314,9 @@ function buildHudResizeCommand(hudPaneId: string, heightLines: number = HUD_TMUX
 }
 
 function buildBestEffortShellCommand(command: string): string {
+  if (process.platform === 'win32' && !isMsysOrGitBash()) {
+    return `$ErrorActionPreference="SilentlyContinue"; try { ${command} *> $null } catch {}; if ($LASTEXITCODE -ne 0) { $global:LASTEXITCODE=0 }`;
+  }
   return `${command} >/dev/null 2>&1 || true`;
 }
 
@@ -646,6 +663,24 @@ export function buildWorkerStartupCommand(
     workerCliOverride,
     initialPrompt,
   );
+  if (process.platform === 'win32' && !isMsysOrGitBash()) {
+    const envPrefix = Object.entries(processSpec.env)
+      .map(([key, value]) => `$env:${key}=${quotePowerShellArg(value)}`)
+      .join('; ');
+    const invocation = [
+      '&',
+      quotePowerShellArg(processSpec.command),
+      ...processSpec.args.map(quotePowerShellArg),
+    ].join(' ');
+    const wrappedCommand = [
+      `$ErrorActionPreference = 'Stop'`,
+      envPrefix,
+      `& { ${invocation} }`,
+    ]
+      .filter((part) => part.trim() !== '')
+      .join('; ');
+    return `powershell.exe -ExecutionPolicy Bypass -NoLogo -NoExit -EncodedCommand ${encodePowerShellCommand(wrappedCommand)}`;
+  }
   const launchSpec = buildWorkerLaunchSpec(process.env.SHELL);
   const leaderNodeDir = resolveLeaderNodePath().replace(/\/[^/]+$/, ''); // dirname
   const pathPrefix = leaderNodeDir ? `export PATH='${leaderNodeDir}':$PATH; ` : '';
@@ -799,6 +834,7 @@ export function createTeamSession(
     const panes = listPanes(teamTarget);
     const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
     const initialHudPaneIds = findHudPaneIds(teamTarget, leaderPaneId);
+    const restoreStandaloneHudOnShutdown = initialHudPaneIds.length > 0;
     // Team mode prioritizes leader + worker visibility. Remove HUD panes in this window
     // to keep a clean "leader left / workers right" layout.
     for (const hudPaneId of initialHudPaneIds) {
@@ -940,6 +976,7 @@ export function createTeamSession(
       hudPaneId,
       resizeHookName,
       resizeHookTarget,
+      restoreStandaloneHudOnShutdown,
     };
   } catch (error) {
     if (registeredClientAttachedHook) {
@@ -1029,22 +1066,80 @@ function paneTarget(sessionName: string, workerIndex: number, workerPaneId?: str
 export const paneIsBootstrapping = sharedPaneIsBootstrapping;
 export const paneLooksReady = sharedPaneLooksReady;
 
-function paneHasTrustPrompt(captured: string): boolean {
-  const lines = captured
+function normalizePromptCaptureLines(captured: string): string[] {
+  return captured
     .split('\n')
-    .map((line) => line.replace(/\r/g, '').trim())
+    .map((line) => stripAnsiEscapeSequences(line).replace(/\r/g, '').trim())
     .filter((line) => line.length > 0);
-  const tail = lines.slice(-12);
-  const hasQuestion = tail.some((line) => /Do you trust the contents of this directory\?/i.test(line));
-  const hasActiveChoices = tail.some((line) => /Yes,\s*continue|No,\s*quit|Press enter to continue/i.test(line));
+}
+
+function normalizePromptMatchText(value: string): string {
+  return stripAnsiEscapeSequences(value)
+    .replace(/\r/g, '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+function paneHasTrustPrompt(captured: string): boolean {
+  const lines = normalizePromptCaptureLines(captured);
+  const tail = lines.slice(-24);
+  const normalizedTail = tail.map(normalizePromptMatchText);
+  const joinedTail = normalizedTail.join('');
+  const hasQuestion = joinedTail.includes('doyoutrustthecontentsofthisdirectory?')
+    || joinedTail.includes('doyoutrustthisdirectory?');
+  const hasActiveChoices = joinedTail.includes('yes,continue')
+    || joinedTail.includes('no,quit')
+    || joinedTail.includes('pressentertocontinue')
+    || joinedTail.includes('workingwithuntrustedcontentscomeswithhigherriskofpromptinjection');
   return hasQuestion && hasActiveChoices;
 }
 
+function captureVisiblePane(target: string): { ok: true; stdout: string } | { ok: false; stderr: string } {
+  return runTmux(sharedBuildVisibleCapturePaneArgv(target));
+}
+
+function paneLikelyNeedsTrustPromptScrollback(captured: string): boolean {
+  const lines = normalizePromptCaptureLines(captured);
+  const tail = lines.slice(-12);
+  const joinedTail = tail.map(normalizePromptMatchText).join('');
+  return joinedTail.includes('doyoutrustthecontentsofthisdirectory?')
+    || joinedTail.includes('doyoutrustthisdirectory?');
+}
+
+function findTrustPromptCapture(target: string): string | null {
+  const visible = captureVisiblePane(target);
+  if (!visible.ok) return null;
+  if (paneHasTrustPrompt(visible.stdout)) return visible.stdout;
+  if (!paneLikelyNeedsTrustPromptScrollback(visible.stdout)) return null;
+
+  const scrollback = runTmux(sharedBuildCapturePaneArgv(target, 80));
+  if (!scrollback.ok) return null;
+  return paneHasTrustPrompt(scrollback.stdout) ? scrollback.stdout : null;
+}
+
+function dismissTrustPromptForTarget(
+  target: string,
+  maxAttempts: number = 3,
+): { found: boolean; cleared: boolean } {
+  if (process.env.OMX_TEAM_AUTO_TRUST === '0') return { found: false, cleared: false };
+
+  const detected = findTrustPromptCapture(target);
+  if (!detected) return { found: false, cleared: false };
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    runTmux(['send-keys', '-t', target, 'C-m']);
+    sleepFractionalSeconds(0.12);
+    runTmux(['send-keys', '-t', target, 'C-m']);
+    sleepFractionalSeconds(0.18);
+
+    if (!findTrustPromptCapture(target)) return { found: true, cleared: true };
+  }
+
+  return { found: true, cleared: false };
+}
+
 function paneHasClaudeBypassPermissionsPrompt(captured: string): boolean {
-  const lines = captured
-    .split('\n')
-    .map((line) => line.replace(/\r/g, '').trim())
-    .filter((line) => line.length > 0);
+  const lines = normalizePromptCaptureLines(captured);
   const tail = lines.slice(-20);
   const hasWarning = tail.some((line) => /Bypass Permissions mode/i.test(line));
   const hasChoices = tail.some((line) => /No,\s*exit/i.test(line))
@@ -1216,7 +1311,7 @@ export function waitForWorkerReady(
 
   const check = (): boolean => {
     const target = paneTarget(sessionName, workerIndex, workerPaneId);
-    const result = runTmux(sharedBuildVisibleCapturePaneArgv(target));
+    const result = captureVisiblePane(target);
     if (!result.ok) return false;
     if (dismissClaudeBypassPermissionsPromptIfPresent(target, result.stdout)) {
       promptDismissed = true;
@@ -1225,11 +1320,14 @@ export function waitForWorkerReady(
     if (paneHasClaudeBypassPermissionsPrompt(result.stdout)) {
       return false;
     }
-    if (paneHasTrustPrompt(result.stdout)) {
+    const trustDismiss = dismissTrustPromptForTarget(target);
+    if (trustDismiss.found) {
       // Default-on for team workers: they are spawned explicitly by the leader in the same cwd.
       // Opt-out by setting OMX_TEAM_AUTO_TRUST=0.
       if (process.env.OMX_TEAM_AUTO_TRUST !== '0') {
-        sendRobustEnter();
+        if (!trustDismiss.cleared) {
+          sendRobustEnter();
+        }
         promptDismissed = true;
         return false;
       }
@@ -1276,17 +1374,9 @@ export function dismissTrustPromptIfPresent(
   workerIndex: number,
   workerPaneId?: string,
 ): boolean {
-  if (process.env.OMX_TEAM_AUTO_TRUST === '0') return false;
   if (!isTmuxAvailable()) return false;
   const target = paneTarget(sessionName, workerIndex, workerPaneId);
-  const result = runTmux(sharedBuildVisibleCapturePaneArgv(target));
-  if (!result.ok) return false;
-  if (!paneHasTrustPrompt(result.stdout)) return false;
-  // Trust prompt detected; send C-m twice to dismiss (trust + follow-up splash)
-  runTmux(['send-keys', '-t', target, 'C-m']);
-  sleepFractionalSeconds(0.12);
-  runTmux(['send-keys', '-t', target, 'C-m']);
-  return true;
+  return dismissTrustPromptForTarget(target).found;
 }
 
 export const normalizeTmuxCapture = sharedNormalizeTmuxCapture;
@@ -1337,11 +1427,11 @@ export async function sendToWorker(
   if (dismissClaudeBypassPermissionsPromptIfPresent(target, capturedStr)) {
     await sleep(200);
   }
-  if (paneHasTrustPrompt(capturedStr)) {
-    await sendKeyAsync(target, 'C-m');
-    await sleep(120);
-    await sendKeyAsync(target, 'C-m');
+  if (dismissTrustPromptForTarget(target).found) {
     await sleep(200);
+    if (findTrustPromptCapture(target)) {
+      throw new Error('sendToWorker: trust_prompt_blocked');
+    }
   }
 
   sendLiteralTextOrThrow(target, text);
@@ -1489,7 +1579,7 @@ export async function killWorkerByPaneIdAsync(workerPaneId: string, leaderPaneId
   if (!workerPaneId.startsWith('%')) return;
   // Guard: never kill the leader's own pane.
   if (leaderPaneId && workerPaneId === leaderPaneId) return;
-  await runTmuxAsync(['kill-pane', '-t', workerPaneId]);
+  await killPaneByIdBestEffort(workerPaneId);
 }
 
 export interface PaneTeardownSummary {
@@ -1551,6 +1641,35 @@ function normalizePaneTargets(
   return { killablePaneIds, excluded };
 }
 
+function paneExistsById(paneId: string): boolean | null {
+  const result = runTmux(['list-panes', '-t', paneId, '-F', '#{pane_id}']);
+  if (!result.ok) return null;
+  return result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .some((line) => line === paneId);
+}
+
+async function killPaneByIdBestEffort(paneId: string, maxAttempts: number = 3): Promise<boolean> {
+  const attempts = Math.max(1, Math.floor(maxAttempts));
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const result = await runTmuxAsync(['kill-pane', '-t', paneId]);
+    const existsAfter = paneExistsById(paneId);
+    if (result.ok) {
+      if (existsAfter !== true) return true;
+      await sleep(80);
+      continue;
+    }
+    if (existsAfter === false) return false;
+    if (attempt < attempts - 1) {
+      await sleep(120);
+    }
+  }
+  const finalExists = paneExistsById(paneId);
+  return finalExists !== true;
+}
+
 /**
  * Shared pane-id-direct teardown primitive for worker pane cleanup.
  * Must remain liveness-agnostic: do not gate on isWorkerAlive/killWorker.
@@ -1576,8 +1695,8 @@ export async function teardownWorkerPanes(
   };
 
   for (const paneId of killablePaneIds) {
-    const result = await runTmuxAsync(['kill-pane', '-t', paneId]);
-    if (result.ok) summary.kill.succeeded += 1;
+    const killed = await killPaneByIdBestEffort(paneId);
+    if (killed) summary.kill.succeeded += 1;
     else summary.kill.failed += 1;
     await sleep(perPaneGrace);
   }

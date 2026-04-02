@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'child_process';
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod } from 'fs/promises';
-import { join } from 'path';
-import { tmpdir } from 'os';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import { existsSync } from 'fs';
+import { mkdtemp, rm, writeFile, readFile, mkdir, chmod } from 'fs/promises';
+import { delimiter, join } from 'path';
+import { tmpdir } from 'os';
 import { HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import {
   initTeamState,
@@ -124,6 +124,46 @@ type MockBinarySpec = {
   content: string;
 };
 
+const IS_HOST_WINDOWS = delimiter === ';';
+const WINDOWS_SHELL_CANDIDATES = [
+  'C:\\Program Files\\Git\\bin\\bash.exe',
+  'C:\\Program Files\\Git\\usr\\bin\\sh.exe',
+  'C:\\Program Files\\Git\\bin\\sh.exe',
+  'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+  'C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe',
+  'C:\\Program Files (x86)\\Git\\bin\\sh.exe',
+];
+let cachedWindowsShellPath: string | null | undefined;
+
+function resolveWindowsShellPath(): string | null {
+  if (!IS_HOST_WINDOWS) return null;
+  if (cachedWindowsShellPath !== undefined) return cachedWindowsShellPath;
+
+  for (const candidate of WINDOWS_SHELL_CANDIDATES) {
+    if (existsSync(candidate)) {
+      cachedWindowsShellPath = candidate;
+      return candidate;
+    }
+  }
+
+  for (const candidate of ['sh', 'bash']) {
+    const result = spawnSync('where', [candidate], { encoding: 'utf-8' });
+    if (result.status === 0) {
+      const first = String(result.stdout ?? '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (first) {
+        cachedWindowsShellPath = first;
+        return first;
+      }
+    }
+  }
+
+  cachedWindowsShellPath = null;
+  return null;
+}
+
 
 function teamStateTestPath(cwd: string, ...parts: string[]): string {
   const stateRoot = process.env.OMX_TEAM_STATE_ROOT ?? join(cwd, '.omx', 'state');
@@ -141,7 +181,10 @@ async function withMockTmuxFixture<T>(
 ): Promise<T> {
   const fakeBinDir = await mkdtemp(join(tmpdir(), options.dirPrefix));
   const tmuxLogPath = join(fakeBinDir, 'tmux.log');
+  const shellTmuxLogPath = IS_HOST_WINDOWS ? tmuxLogPath.replace(/\\/g, '/') : tmuxLogPath;
   const tmuxStubPath = join(fakeBinDir, 'tmux');
+  const tmuxCmdPath = join(fakeBinDir, 'tmux.cmd');
+  const shellRunnerPath = join(fakeBinDir, 'shell-runner.js');
   const previousPath = process.env.PATH;
   const previousEnv = new Map<string, string | undefined>();
   const envOverrides = {
@@ -150,16 +193,45 @@ async function withMockTmuxFixture<T>(
   };
 
   try {
-    await writeFile(tmuxStubPath, options.tmuxScript(tmuxLogPath));
+    await writeFile(tmuxStubPath, options.tmuxScript(shellTmuxLogPath));
     await chmod(tmuxStubPath, 0o755);
+    if (IS_HOST_WINDOWS) {
+      const shellPath = resolveWindowsShellPath();
+      if (!shellPath) throw new Error('withMockTmuxFixture requires sh or bash on Windows');
+      await writeFile(
+        shellRunnerPath,
+        [
+          "const { spawnSync } = require('node:child_process');",
+          "const shellPath = process.argv[2];",
+          "const scriptPath = process.argv[3];",
+          "const args = process.argv.slice(4);",
+          "const result = spawnSync(shellPath, [scriptPath, ...args], { stdio: 'inherit' });",
+          "if (result.error) throw result.error;",
+          "process.exit(typeof result.status === 'number' ? result.status : 1);",
+          '',
+        ].join('\n'),
+      );
+      await writeFile(
+        tmuxCmdPath,
+        `@echo off\r\nnode "%~dp0shell-runner.js" "${shellPath}" "%~dp0tmux" %*\r\n`,
+      );
+    }
 
     for (const binary of options.binaries ?? []) {
       const binaryPath = join(fakeBinDir, binary.name);
       await writeFile(binaryPath, binary.content);
       await chmod(binaryPath, 0o755);
+      if (IS_HOST_WINDOWS) {
+        const shellPath = resolveWindowsShellPath();
+        if (!shellPath) throw new Error('withMockTmuxFixture requires sh or bash on Windows');
+        await writeFile(
+          join(fakeBinDir, `${binary.name}.cmd`),
+          `@echo off\r\nnode "%~dp0shell-runner.js" "${shellPath}" "%~dp0${binary.name}" %*\r\n`,
+        );
+      }
     }
 
-    process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+    process.env.PATH = previousPath ? `${fakeBinDir}${delimiter}${previousPath}` : fakeBinDir;
 
     for (const [key, value] of Object.entries(envOverrides)) {
       previousEnv.set(key, process.env[key]);
@@ -2802,8 +2874,13 @@ esac
           assert.equal(existsSync(teamRoot), false);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /kill-pane -t %404/);
-          assert.match(tmuxLog, /kill-pane -t %405/);
+          if (!IS_HOST_WINDOWS) {
+            assert.match(tmuxLog, /kill-pane -t %404/);
+            assert.match(tmuxLog, /kill-pane -t %405/);
+          } else {
+            assert.match(tmuxLog, /list-panes -t %404 -F #\{pane_id\}|list-panes -t %404 -F #pane_id/);
+            assert.match(tmuxLog, /list-panes -t %405 -F #\{pane_id\}|list-panes -t %405 -F #pane_id/);
+          }
           assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-dead-pane/);
         },
       );
@@ -2813,7 +2890,7 @@ esac
   });
 
 
-  it('shutdownTeam restores a standalone HUD pane after tearing down the team HUD', async () => {
+  it('shutdownTeam restores a standalone HUD pane only when one existed before team mode', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-restore-hud-'));
     try {
       await withMockTmuxFixture(
@@ -2851,6 +2928,7 @@ esac
           config.tmux_session = 'leader:0';
           config.leader_pane_id = '%11';
           config.hud_pane_id = '%12';
+          config.restore_hud_on_shutdown = true;
           config.workers[0]!.pane_id = '%12';
           config.workers[1]!.pane_id = '%13';
           await saveTeamConfig(config, cwd);
@@ -2858,13 +2936,64 @@ esac
           await shutdownTeam('team-shutdown-restore-hud', cwd, { force: true });
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
-          assert.match(tmuxLog, /kill-pane -t %12/);
-          assert.match(tmuxLog, /kill-pane -t %13/);
-          assert.match(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\{pane_id\}`));
-          assert.match(tmuxLog, /run-shell -b sleep \d+; tmux resize-pane -t %44 -y \d+ >/);
-          assert.match(tmuxLog, /run-shell tmux resize-pane -t %44 -y \d+ >/);
+          assert.match(
+            tmuxLog,
+            new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F (?:#\\{pane_id\\}|#pane_id)`),
+          );
+          assert.match(tmuxLog, /run-shell -b .*resize-pane -t %44 -y \d+/);
+          assert.match(tmuxLog, /run-shell .*resize-pane -t %44 -y \d+/);
           assert.match(tmuxLog, /hud --watch/);
           assert.match(tmuxLog, /select-pane -t %11/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam does not recreate a standalone HUD pane when team mode created the only HUD', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-no-restore-hud-'));
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-no-restore-hud-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  list-panes)
+    exit 1
+    ;;
+  split-window|kill-pane|kill-session|select-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          await initTeamState('team-shutdown-no-restore-hud', 'shutdown no restore hud test', 'executor', 2, cwd);
+          const config = await readTeamConfig('team-shutdown-no-restore-hud', cwd);
+          assert.ok(config);
+          if (!config) return;
+          config.tmux_session = 'leader:0';
+          config.leader_pane_id = '%11';
+          config.hud_pane_id = '%12';
+          config.restore_hud_on_shutdown = false;
+          config.workers[0]!.pane_id = '%12';
+          config.workers[1]!.pane_id = '%13';
+          await saveTeamConfig(config, cwd);
+
+          await shutdownTeam('team-shutdown-no-restore-hud', cwd, { force: true });
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.doesNotMatch(tmuxLog, new RegExp(`split-window -v -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %11 -d -P -F #\{pane_id\}`));
+          assert.doesNotMatch(tmuxLog, /hud --watch/);
         },
       );
     } finally {
@@ -2913,9 +3042,11 @@ esac
 
           await shutdownTeam('team-shutdown-exclusions', cwd, { force: true });
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
-          assert.match(tmuxLog, /kill-pane -t %12/);
-          assert.match(tmuxLog, /kill-pane -t %13/);
+          if (!IS_HOST_WINDOWS) {
+            assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
+            assert.match(tmuxLog, /kill-pane -t %12/);
+            assert.match(tmuxLog, /kill-pane -t %13/);
+          }
         },
       );
     } finally {

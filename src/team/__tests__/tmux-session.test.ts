@@ -1,10 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
 import { mkdtemp, readFile, rm, writeFile, chmod } from 'fs/promises';
-import { join } from 'path';
+import { delimiter, join } from 'path';
 import { tmpdir } from 'os';
 import {
   buildClientAttachedReconcileHookName,
@@ -51,6 +52,47 @@ import {
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
 
+const IS_HOST_WINDOWS = delimiter === ';';
+const WINDOWS_SHELL_CANDIDATES = [
+  'C:\\Program Files\\Git\\bin\\bash.exe',
+  'C:\\Program Files\\Git\\usr\\bin\\sh.exe',
+  'C:\\Program Files\\Git\\bin\\sh.exe',
+  'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+  'C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe',
+  'C:\\Program Files (x86)\\Git\\bin\\sh.exe',
+];
+
+let cachedWindowsShellPath: string | null | undefined;
+
+function resolveWindowsShellPath(): string | null {
+  if (!IS_HOST_WINDOWS) return null;
+  if (cachedWindowsShellPath !== undefined) return cachedWindowsShellPath;
+
+  for (const candidate of WINDOWS_SHELL_CANDIDATES) {
+    if (fs.existsSync(candidate)) {
+      cachedWindowsShellPath = candidate;
+      return candidate;
+    }
+  }
+
+  for (const candidate of ['sh', 'bash']) {
+    const result = spawnSync('where', [candidate], { encoding: 'utf-8' });
+    if (result.status === 0) {
+      const first = String(result.stdout ?? '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (first) {
+        cachedWindowsShellPath = first;
+        return first;
+      }
+    }
+  }
+
+  cachedWindowsShellPath = null;
+  return null;
+}
+
 function withEmptyPath<T>(fn: () => T): T {
   const prev = process.env.PATH;
   process.env.PATH = '';
@@ -85,6 +127,18 @@ const CLAUDE_BYPASS_PROMPT_CAPTURE = `Bypass Permissions mode
 
 Press Enter to confirm`;
 
+const TRUST_PROMPT_CAPTURE = `Do you trust the contents of this directory?
+Press enter to continue`;
+
+const TRUST_PROMPT_CAPTURE_COMPACT = `Doyoutrustthecontentsofthisdirectory?
+Workingwithuntrustedcontentscomeswith
+higherriskofpromptinjection.
+
+›1.Yes,continue
+2.No,quit
+
+Pressentertocontinue`;
+
 const READY_HELPER_CAPTURE = `╭────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.114.0)                 │
 │                                            │
@@ -114,13 +168,34 @@ async function withMockTmuxFixture<T>(
 ): Promise<T> {
   const fakeBinDir = await mkdtemp(join(tmpdir(), dirPrefix));
   const logPath = join(fakeBinDir, 'tmux.log');
+  const shellLogPath = IS_HOST_WINDOWS ? logPath.replace(/\\/g, '/') : logPath;
   const tmuxStubPath = join(fakeBinDir, 'tmux');
+  const tmuxCmdPath = join(fakeBinDir, 'tmux.cmd');
+  const tmuxRunnerPath = join(fakeBinDir, 'tmux-runner.js');
   const previousPath = process.env.PATH;
 
   try {
-    await writeFile(tmuxStubPath, tmuxScript(logPath));
+    await writeFile(tmuxStubPath, tmuxScript(shellLogPath));
     await chmod(tmuxStubPath, 0o755);
-    process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+    if (IS_HOST_WINDOWS) {
+      const shellPath = resolveWindowsShellPath();
+      if (!shellPath) throw new Error('withMockTmuxFixture requires sh or bash on Windows');
+      await writeFile(
+        tmuxRunnerPath,
+        [
+          "const { spawnSync } = require('node:child_process');",
+          `const shellPath = ${JSON.stringify(shellPath)};`,
+          "const scriptPath = process.argv[2];",
+          "const args = process.argv.slice(3);",
+          "const result = spawnSync(shellPath, [scriptPath, ...args], { stdio: 'inherit' });",
+          "if (result.error) throw result.error;",
+          "process.exit(typeof result.status === 'number' ? result.status : 1);",
+          '',
+        ].join('\n'),
+      );
+      await writeFile(tmuxCmdPath, '@echo off\r\nnode "%~dp0tmux-runner.js" "%~dp0tmux" %*\r\n');
+    }
+    process.env.PATH = previousPath ? `${fakeBinDir}${delimiter}${previousPath}` : fakeBinDir;
     return await run({ logPath });
   } finally {
     if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -267,6 +342,27 @@ describe('HUD resize hook command builders', () => {
       args,
       ['run-shell', `tmux resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true`],
     );
+  });
+
+  it('buildReconcileHudResizeArgs emits a PowerShell best-effort command on native Windows', () => {
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      assert.deepEqual(
+        buildReconcileHudResizeArgs('%7'),
+        ['run-shell', `$ErrorActionPreference="SilentlyContinue"; try { tmux resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} *> $null } catch {}; if ($LASTEXITCODE -ne 0) { $global:LASTEXITCODE=0 }`],
+      );
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+    }
   });
 });
 
@@ -1040,6 +1136,39 @@ describe('buildWorkerStartupCommand', () => {
     }
   });
 
+  it('builds a PowerShell worker launch command on native Windows', () => {
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevMsystem = process.env.MSYSTEM;
+    const prevOstype = process.env.OSTYPE;
+    const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+    delete process.env.MSYSTEM;
+    delete process.env.OSTYPE;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const cmd = buildWorkerStartupCommand('alpha', 1, [], 'C:\\repo');
+      assert.match(cmd, /^powershell\.exe -ExecutionPolicy Bypass -NoLogo -NoExit -EncodedCommand /);
+      assert.doesNotMatch(cmd, /\benv\b .* -lc /);
+      const encoded = cmd.replace(/^powershell\.exe -ExecutionPolicy Bypass -NoLogo -NoExit -EncodedCommand /, '');
+      const decoded = Buffer.from(encoded, 'base64').toString('utf16le');
+      assert.match(decoded, /\$env:OMX_TEAM_WORKER='alpha\/worker-1'/);
+      assert.match(decoded, /codex\.ps1'/);
+      assert.match(decoded, /--dangerously-bypass-approvals-and-sandbox/);
+    } finally {
+      if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevMsystem === 'string') process.env.MSYSTEM = prevMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof prevOstype === 'string') process.env.OSTYPE = prevOstype;
+      else delete process.env.OSTYPE;
+    }
+  });
+
   it('falls back to bash when SHELL is unsupported and zsh candidates are unavailable', () => {
     const prevShell = process.env.SHELL;
     const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
@@ -1553,8 +1682,7 @@ printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
   capture-pane)
     cat <<'EOF'
-Do you trust the contents of this directory?
-Press enter to continue
+${TRUST_PROMPT_CAPTURE}
 EOF
     exit 0
     ;;
@@ -1571,6 +1699,151 @@ esac
           const log = await readFile(logPath, 'utf-8');
           assert.match(log, /capture-pane -t omx-team-x:1 -p/);
           assert.doesNotMatch(log, /capture-pane -t omx-team-x:1 -p -S/);
+        },
+      );
+    } finally {
+      if (typeof previousAutoTrust === 'string') process.env.OMX_TEAM_AUTO_TRUST = previousAutoTrust;
+      else delete process.env.OMX_TEAM_AUTO_TRUST;
+    }
+  });
+
+  it('falls back to recent scrollback when the visible slice truncates the trust prompt footer', async () => {
+    const previousAutoTrust = process.env.OMX_TEAM_AUTO_TRUST;
+    delete process.env.OMX_TEAM_AUTO_TRUST;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-dismiss-trust-scrollback-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
+      cat <<'EOF'
+${TRUST_PROMPT_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+Do you trust the contents of this directory?
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(dismissTrustPromptIfPresent('omx-team-x', 1), true);
+          const log = await readFile(logPath, 'utf-8');
+          assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+          assert.match(log, /send-keys -t omx-team-x:1 C-m/);
+        },
+      );
+    } finally {
+      if (typeof previousAutoTrust === 'string') process.env.OMX_TEAM_AUTO_TRUST = previousAutoTrust;
+      else delete process.env.OMX_TEAM_AUTO_TRUST;
+    }
+  });
+
+  it('retries trust dismissal when the prompt survives the first enter pair', async () => {
+    const previousAutoTrust = process.env.OMX_TEAM_AUTO_TRUST;
+    delete process.env.OMX_TEAM_AUTO_TRUST;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-dismiss-trust-retry-',
+        (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+count_file="$state_dir/enter-count"
+printf '%s\n' "$*" >> "${logPath}"
+count=0
+if [ -f "$count_file" ]; then
+  count="$(cat "$count_file")"
+fi
+case "$1" in
+  capture-pane)
+    if [ "$count" -ge 4 ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${TRUST_PROMPT_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(dismissTrustPromptIfPresent('omx-team-x', 1), true);
+          const log = await readFile(logPath, 'utf-8');
+          const sends = log.match(/send-keys -t omx-team-x:1 C-m/g) || [];
+          assert.equal(sends.length, 4);
+        },
+      );
+    } finally {
+      if (typeof previousAutoTrust === 'string') process.env.OMX_TEAM_AUTO_TRUST = previousAutoTrust;
+      else delete process.env.OMX_TEAM_AUTO_TRUST;
+    }
+  });
+
+  it('detects and dismisses a compacted native-Windows trust prompt capture', async () => {
+    const previousAutoTrust = process.env.OMX_TEAM_AUTO_TRUST;
+    delete process.env.OMX_TEAM_AUTO_TRUST;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-dismiss-trust-compact-',
+        (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+count_file="$state_dir/enter-count"
+printf '%s\n' "$*" >> "${logPath}"
+count=0
+if [ -f "$count_file" ]; then
+  count="$(cat "$count_file")"
+fi
+case "$1" in
+  capture-pane)
+    if [ "$count" -ge 2 ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${TRUST_PROMPT_CAPTURE_COMPACT}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(dismissTrustPromptIfPresent('omx-team-x', 1), true);
+          const log = await readFile(logPath, 'utf-8');
+          const sends = log.match(/send-keys -t omx-team-x:1 C-m/g) || [];
+          assert.equal(sends.length, 2);
         },
       );
     } finally {

@@ -88,6 +88,8 @@ export interface TeamConfig {
   resize_hook_name: string | null;
   /** Registered HUD resize hook target in "<session>:<window>" form. */
   resize_hook_target: string | null;
+  /** Restore a pre-existing standalone HUD pane when team shutdown completes. */
+  restore_hud_on_shutdown?: boolean;
   /** Monotonic counter for worker index assignment during scaling. */
   next_worker_index?: number;
 }
@@ -244,6 +246,7 @@ export interface TeamManifestV2 {
   hud_pane_id: string | null;
   resize_hook_name: string | null;
   resize_hook_target: string | null;
+  restore_hud_on_shutdown?: boolean;
   /** Monotonic counter for worker index assignment during scaling. */
   next_worker_index?: number;
 }
@@ -669,6 +672,7 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
   if (!(typeof v.hud_pane_id === 'string' || v.hud_pane_id === null)) return false;
   if (!(typeof v.resize_hook_name === 'string' || v.resize_hook_name === null)) return false;
   if (!(typeof v.resize_hook_target === 'string' || v.resize_hook_target === null)) return false;
+  if (!(typeof v.restore_hud_on_shutdown === 'boolean' || typeof v.restore_hud_on_shutdown === 'undefined')) return false;
   if (!v.leader || typeof v.leader !== 'object') return false;
   if (!v.policy || typeof v.policy !== 'object') return false;
   if (!v.permissions_snapshot || typeof v.permissions_snapshot !== 'object') return false;
@@ -775,6 +779,7 @@ export async function initTeamState(
     hud_pane_id: null,
     resize_hook_name: null,
     resize_hook_target: null,
+    restore_hud_on_shutdown: false,
     next_worker_index: workerCount + 1,
   };
 
@@ -817,6 +822,7 @@ export async function initTeamState(
       hud_pane_id: null,
       resize_hook_name: null,
       resize_hook_target: null,
+      restore_hud_on_shutdown: false,
       next_worker_index: workerCount + 1,
     },
     cwd
@@ -848,6 +854,7 @@ async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
       hud_pane_id: normalized.hud_pane_id,
       resize_hook_name: normalized.resize_hook_name,
       resize_hook_target: normalized.resize_hook_target,
+      restore_hud_on_shutdown: normalized.restore_hud_on_shutdown ?? existing.restore_hud_on_shutdown,
       next_worker_index: normalized.next_worker_index ?? existing.next_worker_index,
     };
     await writeTeamManifestV2(merged, cwd);
@@ -880,6 +887,7 @@ function teamConfigFromManifest(manifest: TeamManifestV2): TeamConfig {
     hud_pane_id: manifest.hud_pane_id,
     resize_hook_name: manifest.resize_hook_name,
     resize_hook_target: manifest.resize_hook_target,
+    restore_hud_on_shutdown: manifest.restore_hud_on_shutdown,
     next_worker_index: manifest.next_worker_index,
   };
 }
@@ -893,6 +901,7 @@ function normalizeTeamConfig(config: TeamConfig): TeamConfig {
     hud_pane_id: config.hud_pane_id ?? null,
     resize_hook_name: config.resize_hook_name ?? null,
     resize_hook_target: config.resize_hook_target ?? null,
+    restore_hud_on_shutdown: config.restore_hud_on_shutdown === true,
     worker_launch_mode: workerLaunchMode,
   };
 }
@@ -930,6 +939,7 @@ function teamManifestFromConfig(config: TeamConfig): TeamManifestV2 {
     hud_pane_id: normalized.hud_pane_id,
     resize_hook_name: normalized.resize_hook_name,
     resize_hook_target: normalized.resize_hook_target,
+    restore_hud_on_shutdown: normalized.restore_hud_on_shutdown,
     next_worker_index: normalized.next_worker_index,
   };
 }

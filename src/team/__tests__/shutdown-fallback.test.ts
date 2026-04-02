@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { readTeamConfig, saveTeamConfig } from '../state.js';
 import { shutdownTeam, startTeam, type TeamRuntime } from '../runtime.js';
 
@@ -48,7 +48,7 @@ process.on('SIGTERM', () => process.exit(0));
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
 
-    process.env.PATH = `${binDir}:${prevPath ?? ''}`;
+    process.env.PATH = prevPath ? `${binDir}${delimiter}${prevPath}` : binDir;
     delete process.env.TMUX;
     process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
     process.env.OMX_TEAM_WORKER_CLI = 'codex';

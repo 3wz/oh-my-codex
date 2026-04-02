@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 interface TmuxEnvSnapshot {
   TMUX?: string;
@@ -87,6 +87,27 @@ function uniqueTmuxIdentifier(prefix: string): string {
   return `${prefix}-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function buildFixtureKeepaliveCommand(): string {
+  if (delimiter === ';') {
+    return 'powershell.exe -NoLogo -NoProfile -Command "Start-Sleep -Seconds 300"';
+  }
+  return 'sleep 300';
+}
+
+async function removeFixtureDirBestEffort(path: string): Promise<void> {
+  const attempts = delimiter === ';' ? 20 : 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (error: unknown) {
+      const err = error as NodeJS.ErrnoException;
+      if (attempt >= attempts - 1 || err.code !== 'EBUSY') throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
 export async function withTempTmuxSession<T>(
   optionsOrFn: TempTmuxSessionOptions | ((fixture: TempTmuxSessionFixture) => Promise<T> | T),
   maybeFn?: (fixture: TempTmuxSessionFixture) => Promise<T> | T,
@@ -118,7 +139,7 @@ export async function withTempTmuxSession<T>(
     sessionName,
     '-c',
     fixtureCwd,
-    'sleep 300',
+    buildFixtureKeepaliveCommand(),
   ], tmuxOptions);
   const [windowTarget = '', leaderPaneId = ''] = created.split(/\s+/, 2);
   if (windowTarget === '' || leaderPaneId === '') {
@@ -129,7 +150,7 @@ export async function withTempTmuxSession<T>(
         runTmux(['kill-session', '-t', sessionName], tmuxOptions);
       }
     } catch {}
-    await rm(fixtureCwd, { recursive: true, force: true });
+    await removeFixtureDirBestEffort(fixtureCwd);
     throw new Error(`failed to create temporary tmux fixture: ${created}`);
   }
 
@@ -162,6 +183,9 @@ export async function withTempTmuxSession<T>(
       }
     } catch {}
     applyTmuxEnv(previousEnv);
-    await rm(fixtureCwd, { recursive: true, force: true });
+    if (delimiter === ';') {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    await removeFixtureDirBestEffort(fixtureCwd);
   }
 }
