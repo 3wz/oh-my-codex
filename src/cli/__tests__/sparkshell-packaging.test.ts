@@ -6,6 +6,7 @@ import { arch, platform } from 'node:os';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { spawnPlatformCommandSync } from '../../utils/platform-command.js';
 
 type PackageJson = {
   bin?: string | Record<string, string>;
@@ -61,7 +62,7 @@ describe('sparkshell packaging scaffold', () => {
       assert.equal(buildResult.status, 0, buildResult.stderr || buildResult.stdout);
       assert.equal(existsSync(packagedBinaryPath), true, `expected staged binary at ${packagedBinaryRelativePath}`);
 
-      const packed = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+      const { result: packed } = spawnPlatformCommandSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
         cwd: process.cwd(),
         encoding: 'utf-8',
       });

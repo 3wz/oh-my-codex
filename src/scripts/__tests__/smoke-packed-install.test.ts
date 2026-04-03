@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import {
   ensureRepoDependencies,
@@ -29,7 +29,7 @@ test('resolveGitCommonDir resolves relative git common dir output against the re
     stdout: '../primary/.git\n',
     stderr: '',
   }) as ReturnType<typeof import('node:child_process').spawnSync>);
-  assert.equal(commonDir, '/tmp/primary/.git');
+  assert.equal(commonDir, resolve('/tmp/worktree', '../primary/.git'));
 });
 
 test('hasUsableNodeModules requires the packaged build dependencies', async () => {

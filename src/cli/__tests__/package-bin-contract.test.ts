@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, rmSync } from 'node:fs';
 import { arch, platform } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnPlatformCommandSync } from '../../utils/platform-command.js';
 
 type PackageJson = {
   files?: string[];
@@ -38,6 +38,7 @@ describe('package bin contract', () => {
     assert.equal(pkg.scripts?.['build:explore:release'], 'node dist/scripts/build-explore-harness.js');
     assert.equal(pkg.scripts?.['build:full'], 'npm run build && npm run build:explore:release && npm run build:sparkshell');
     assert.equal(pkg.scripts?.['clean:native-package-assets'], 'node dist/scripts/cleanup-explore-harness.js');
+    assert.equal(pkg.scripts?.['install:packed-global'], 'node dist/scripts/install-packed-global.js');
     assert.equal(pkg.scripts?.prepack, 'npm run build && npm run clean:native-package-assets');
     assert.equal(pkg.scripts?.postpack, 'npm run clean:native-package-assets');
     assert.equal(pkg.scripts?.['test:explore'], 'cargo test -p omx-explore-harness && node --test dist/cli/__tests__/explore.test.js dist/hooks/__tests__/explore-routing.test.js dist/hooks/__tests__/explore-sparkshell-guidance-contract.test.js');
@@ -54,7 +55,7 @@ describe('package bin contract', () => {
 
     rmSync(packagedSparkShellPath, { force: true });
 
-    const packed = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+    const { result: packed } = spawnPlatformCommandSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
       cwd: process.cwd(),
       encoding: 'utf-8',
     });

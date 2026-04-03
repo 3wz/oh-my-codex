@@ -8,8 +8,13 @@ import {
 import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { spawnPlatformCommandSync } from '../utils/platform-command.js';
+
+type StringSpawnOptions = Omit<SpawnSyncOptionsWithStringEncoding, 'encoding'> & {
+  encoding?: BufferEncoding;
+};
 
 const REQUIRED_NODE_MODULE_MARKERS = [
   join('typescript', 'package.json'),
@@ -93,26 +98,41 @@ export function resolveReusableNodeModulesSource(repoRoot: string, gitRunner = s
   return join(primaryRepoRoot, 'node_modules');
 }
 
-function formatCommandFailure(cmd: string, args: string[], result: { stdout?: string; stderr?: string }): string {
+function formatCommandFailure(
+  cmd: string,
+  args: string[],
+  result: { stdout?: string; stderr?: string; error?: NodeJS.ErrnoException | Error | null },
+): string {
   return [
     `Command failed: ${cmd} ${args.join(' ')}`,
+    result.error?.message ? `error:\n${result.error.message}` : '',
     result.stdout?.trim() ? `stdout:\n${result.stdout.trim()}` : '',
     result.stderr?.trim() ? `stderr:\n${result.stderr.trim()}` : '',
   ].filter(Boolean).join('\n\n');
+}
+
+function runPlatformCommand(
+  cmd: string,
+  args: readonly string[],
+  options: StringSpawnOptions = {},
+): ReturnType<typeof spawnSync> {
+  const spawnOptions: SpawnSyncOptionsWithStringEncoding = {
+    ...options,
+    encoding: options.encoding ?? 'utf-8',
+    stdio: options.stdio ?? 'pipe',
+  };
+  const { result } = spawnPlatformCommandSync(cmd, [...args], spawnOptions);
+  if (result.status !== 0) {
+    throw new Error(formatCommandFailure(cmd, [...args], result));
+  }
+  return result;
 }
 
 export function ensureRepoDependencies(repoRoot: string, options: EnsureRepoDepsOptions = {}): EnsureRepoDepsResult {
   const {
     gitRunner = spawnSync,
     install = (cwd: string) => {
-      const result = spawnSync('npm', ['ci'], {
-        cwd,
-        encoding: 'utf-8',
-        stdio: 'pipe',
-      });
-      if (result.status !== 0) {
-        throw new Error(formatCommandFailure('npm', ['ci'], result));
-      }
+      runPlatformCommand('npm', ['ci'], { cwd });
     },
     remove = rmSync,
     symlink = symlinkSync,
@@ -161,16 +181,8 @@ function parseArgs(argv: string[]): void {
   }
 }
 
-function run(cmd: string, args: readonly string[], options: Record<string, unknown> = {}): ReturnType<typeof spawnSync> {
-  const result = spawnSync(cmd, [...args], {
-    encoding: 'utf-8',
-    stdio: 'pipe',
-    ...options,
-  });
-  if (result.status !== 0) {
-    throw new Error(formatCommandFailure(cmd, [...args], result));
-  }
-  return result;
+function run(cmd: string, args: readonly string[], options: StringSpawnOptions = {}): ReturnType<typeof spawnSync> {
+  return runPlatformCommand(cmd, args, options);
 }
 
 function npmBinName(name: string): string {
